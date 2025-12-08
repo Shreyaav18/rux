@@ -140,6 +140,9 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            Statement::Print { expression } => {
+                self.check_expression(expression)?;
+            }
             Statement::Expression { expression } => {
                 self.check_expression(expression)?;
             }

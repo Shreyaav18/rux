@@ -48,6 +48,9 @@ pub enum Statement {
     Return {
         value: Option<Expression>,
     },
+    Print {
+        expression: Expression,
+    },
     Expression {
         expression: Expression,
     },

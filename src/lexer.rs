@@ -229,6 +229,7 @@ impl Lexer {
             "else" => TokenType::Else,
             "while" => TokenType::While,
             "return" => TokenType::Return,
+            "print" => TokenType::Print,
             _ => TokenType::Identifier,
         };
 

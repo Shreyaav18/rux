@@ -77,7 +77,7 @@ src/
 
 ## Requirements
 
-- Rust 2021 edition or later
+- Rust 2024 edition
 - No external dependencies
 
 ## Tested Examples

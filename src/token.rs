@@ -14,6 +14,7 @@ pub enum TokenType {
     Else,
     While,
     Return,
+    Print,
     Plus,
     Minus,
     Star,

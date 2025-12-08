@@ -89,7 +89,9 @@ impl Parser {
         } else if self.match_token(TokenType::While) {
             self.parse_while_statement()
         } else if self.match_token(TokenType::Return) {
-            self.parse_return_statement()
+            self.parse_return_statement()   
+        } else if self.match_token(TokenType::Print) {
+            self.parse_print_statement()
         } else if self.check(TokenType::Identifier) && self.peek_ahead(1).token_type == TokenType::Equal {
             self.parse_assignment_statement()
         } else {
@@ -187,6 +189,14 @@ impl Parser {
         Ok(Statement::Return { value })
     }
 
+    fn parse_print_statement(&mut self) -> Result<Statement, String> {
+        self.consume(TokenType::LeftParen, "Expected '(' after 'print'")?;
+        let expression = self.parse_expression()?;
+        self.consume(TokenType::RightParen, "Expected ')' after expression")?;
+        self.consume(TokenType::Semicolon, "Expected ';' after print statement")?;
+        Ok(Statement::Print { expression })
+    }
+    
     fn parse_expression_statement(&mut self) -> Result<Statement, String> {
         let expression = self.parse_expression()?;
         self.consume(TokenType::Semicolon, "Expected ';' after expression")?;
