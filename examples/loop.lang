@@ -1,0 +1,12 @@
+fn main() -> int {
+    let sum: int = 0;
+    let i: int = 1;
+    
+    while (i <= 10) {
+        sum = sum + i;
+        print(sum);
+        i = i + 1;
+    }
+    
+    return 0;
+}
