@@ -1,242 +1,212 @@
 use crate::ast::*;
+use crate::token::{CompileError, CompilePhase};
 use std::collections::HashMap;
 
+/// One entry in the function registry.
+#[derive(Clone)]
+struct FunctionSig {
+    param_types: Vec<Type>,
+    return_type: Type,
+}
+
 pub struct SemanticAnalyzer {
+    /// Lexical scopes, innermost last.
     symbol_table: Vec<HashMap<String, Type>>,
-    functions: HashMap<String, (Vec<Type>, Type)>,
-    current_function_return_type: Option<Type>,
+    functions: HashMap<String, FunctionSig>,
+    /// Return type of the function currently being checked.
+    current_return_type: Option<Type>,
+    /// Whether we are currently inside a loop (for break/continue validation).
+    loop_depth: usize,
+}
+
+impl Default for SemanticAnalyzer {
+    fn default() -> Self {
+        Self {
+            symbol_table: vec![HashMap::new()],
+            functions: HashMap::new(),
+            current_return_type: None,
+            loop_depth: 0,
+        }
+    }
 }
 
 impl SemanticAnalyzer {
     pub fn new() -> Self {
-        Self {
-            symbol_table: vec![HashMap::new()],
-            functions: HashMap::new(),
-            current_function_return_type: None,
-        }
+        Self::default()
     }
 
-    pub fn analyze(&mut self, program: &Program) -> Result<(), String> {
+    // ── Public entry point ────────────────────────────────────────────────────
+
+    pub fn analyze(&mut self, program: &Program) -> Result<(), CompileError> {
+        // First pass: register all function signatures so forward calls work.
         for function in &program.functions {
-            let param_types: Vec<Type> = function.parameters.iter()
-                .map(|p| p.param_type.clone())
-                .collect();
-            
             if self.functions.contains_key(&function.name) {
-                return Err(format!("Function '{}' already declared", function.name));
+                return Err(self.error(format!("function '{}' is already declared", function.name)));
             }
-            
-            self.functions.insert(
-                function.name.clone(),
-                (param_types, function.return_type.clone())
-            );
+            self.functions.insert(function.name.clone(), FunctionSig {
+                param_types: function.parameters.iter().map(|p| p.param_type.clone()).collect(),
+                return_type: function.return_type.clone(),
+            });
         }
 
+        // Second pass: type-check bodies.
         for function in &program.functions {
             self.check_function(function)?;
         }
 
         if !self.functions.contains_key("main") {
-            return Err("Program must have a 'main' function".to_string());
+            return Err(self.error("program must have a 'main' function"));
         }
 
         Ok(())
     }
 
-    fn check_function(&mut self, function: &FunctionDecl) -> Result<(), String> {
+    // ── Function & statement checking ─────────────────────────────────────────
+
+    fn check_function(&mut self, function: &FunctionDecl) -> Result<(), CompileError> {
         self.enter_scope();
-        self.current_function_return_type = Some(function.return_type.clone());
+        self.current_return_type = Some(function.return_type.clone());
 
         for param in &function.parameters {
             self.declare_variable(param.name.clone(), param.param_type.clone())?;
         }
 
-        for statement in &function.body {
-            self.check_statement(statement)?;
+        for stmt in &function.body {
+            self.check_statement(stmt)?;
         }
 
         self.exit_scope();
-        self.current_function_return_type = None;
-
+        self.current_return_type = None;
         Ok(())
     }
 
-    fn check_statement(&mut self, statement: &Statement) -> Result<(), String> {
-        match statement {
+    fn check_statement(&mut self, stmt: &Statement) -> Result<(), CompileError> {
+        match stmt {
             Statement::LetDecl { name, var_type, initializer } => {
-                if let Some(init_expr) = initializer {
-                    let expr_type = self.check_expression(init_expr)?;
-                    if &expr_type != var_type {
-                        return Err(format!(
-                            "Type mismatch: variable '{}' declared as {:?} but initialized with {:?}",
-                            name, var_type, expr_type
-                        ));
+                if let Some(init) = initializer {
+                    let actual = self.check_expression(init)?;
+                    if &actual != var_type {
+                        return Err(self.error(format!(
+                            "type mismatch: variable '{}' declared as {:?} but initialiser has type {:?}",
+                            name, var_type, actual
+                        )));
                     }
                 }
                 self.declare_variable(name.clone(), var_type.clone())?;
             }
+
             Statement::Assignment { name, value } => {
-                let var_type = self.lookup_variable(name)?;
-                let value_type = self.check_expression(value)?;
-                if var_type != value_type {
-                    return Err(format!(
-                        "Type mismatch: cannot assign {:?} to variable '{}' of type {:?}",
-                        value_type, name, var_type
-                    ));
+                let declared = self.lookup_variable(name)?;
+                let actual = self.check_expression(value)?;
+                if declared != actual {
+                    return Err(self.error(format!(
+                        "cannot assign {:?} to '{}' which has type {:?}",
+                        actual, name, declared
+                    )));
                 }
             }
+
             Statement::If { condition, then_branch, else_branch } => {
-                let cond_type = self.check_expression(condition)?;
-                if cond_type != Type::Bool {
-                    return Err(format!("If condition must be boolean, got {:?}", cond_type));
-                }
-                
-                self.enter_scope();
-                for stmt in then_branch {
-                    self.check_statement(stmt)?;
-                }
-                self.exit_scope();
-
+                self.expect_type(condition, &Type::Bool, "if condition")?;
+                self.check_block(then_branch)?;
                 if let Some(else_stmts) = else_branch {
-                    self.enter_scope();
-                    for stmt in else_stmts {
-                        self.check_statement(stmt)?;
-                    }
-                    self.exit_scope();
+                    self.check_block(else_stmts)?;
                 }
             }
+
             Statement::While { condition, body } => {
-                let cond_type = self.check_expression(condition)?;
-                if cond_type != Type::Bool {
-                    return Err(format!("While condition must be boolean, got {:?}", cond_type));
-                }
-
-                self.enter_scope();
-                for stmt in body {
-                    self.check_statement(stmt)?;
-                }
-                self.exit_scope();
+                self.expect_type(condition, &Type::Bool, "while condition")?;
+                self.loop_depth += 1;
+                self.check_block(body)?;
+                self.loop_depth -= 1;
             }
-            Statement::Return { value } => {
-                let return_type = self.current_function_return_type.clone()
-                    .ok_or("Return statement outside of function")?;
 
-                match (value, &return_type) {
-                    (Some(_), Type::Void) => {
-                        return Err("Cannot return a value from void function".to_string());
-                    }
+            Statement::Break | Statement::Continue => {
+                if self.loop_depth == 0 {
+                    let kw = if matches!(stmt, Statement::Break) { "break" } else { "continue" };
+                    return Err(self.error(format!("'{}' used outside of a loop", kw)));
+                }
+            }
+
+            Statement::Return { value } => {
+                let expected = self.current_return_type.clone()
+                    .ok_or_else(|| self.error("return statement outside of a function"))?;
+
+                match (value, &expected) {
+                    (Some(_), Type::Void) =>
+                        return Err(self.error("cannot return a value from a void function")),
                     (None, Type::Void) => {}
-                    (None, _) => {
-                        return Err(format!("Function must return a value of type {:?}", return_type));
-                    }
+                    (None, _) =>
+                        return Err(self.error(format!("missing return value; expected {:?}", expected))),
                     (Some(expr), expected_type) => {
-                        let expr_type = self.check_expression(expr)?;
-                        if &expr_type != expected_type {
-                            return Err(format!(
-                                "Return type mismatch: expected {:?}, got {:?}",
-                                expected_type, expr_type
-                            ));
+                        let actual = self.check_expression(expr)?;
+                        if &actual != expected_type {
+                            return Err(self.error(format!(
+                                "return type mismatch: expected {:?}, got {:?}",
+                                expected_type, actual
+                            )));
                         }
                     }
                 }
             }
-            Statement::Print { expression } => {
-                self.check_expression(expression)?;
-            }
-            Statement::Expression { expression } => {
-                self.check_expression(expression)?;
-            }
-        }
 
+            Statement::Print { expression } => { self.check_expression(expression)?; }
+            Statement::Expression { expression } => { self.check_expression(expression)?; }
+        }
         Ok(())
     }
 
-    fn check_expression(&mut self, expression: &Expression) -> Result<Type, String> {
-        match expression {
-            Expression::IntLiteral(_) => Ok(Type::Int),
-            Expression::BoolLiteral(_) => Ok(Type::Bool),
+    fn check_block(&mut self, stmts: &[Statement]) -> Result<(), CompileError> {
+        self.enter_scope();
+        for stmt in stmts {
+            self.check_statement(stmt)?;
+        }
+        self.exit_scope();
+        Ok(())
+    }
+
+    fn check_expression(&mut self, expr: &Expression) -> Result<Type, CompileError> {
+        match expr {
+            Expression::IntLiteral(_)    => Ok(Type::Int),
+            Expression::BoolLiteral(_)   => Ok(Type::Bool),
             Expression::StringLiteral(_) => Ok(Type::String),
-            Expression::Variable(name) => self.lookup_variable(name),
-            Expression::Binary { left, operator, right } => {
-                let left_type = self.check_expression(left)?;
-                let right_type = self.check_expression(right)?;
+            Expression::Variable(name)   => self.lookup_variable(name),
 
-                match operator {
-                    BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulo => {
-                        if left_type != Type::Int || right_type != Type::Int {
-                            return Err(format!(
-                                "Arithmetic operations require int operands, got {:?} and {:?}",
-                                left_type, right_type
-                            ));
-                        }
-                        Ok(Type::Int)
-                    }
-                    BinaryOp::Equal | BinaryOp::NotEqual => {
-                        if left_type != right_type {
-                            return Err(format!(
-                                "Equality comparison requires same types, got {:?} and {:?}",
-                                left_type, right_type
-                            ));
-                        }
-                        Ok(Type::Bool)
-                    }
-                    BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                        if left_type != Type::Int || right_type != Type::Int {
-                            return Err(format!(
-                                "Comparison operations require int operands, got {:?} and {:?}",
-                                left_type, right_type
-                            ));
-                        }
-                        Ok(Type::Bool)
-                    }
-                    BinaryOp::And | BinaryOp::Or => {
-                        if left_type != Type::Bool || right_type != Type::Bool {
-                            return Err(format!(
-                                "Logical operations require bool operands, got {:?} and {:?}",
-                                left_type, right_type
-                            ));
-                        }
-                        Ok(Type::Bool)
-                    }
-                }
-            }
             Expression::Unary { operator, operand } => {
-                let operand_type = self.check_expression(operand)?;
-
+                let t = self.check_expression(operand)?;
                 match operator {
-                    UnaryOp::Negate => {
-                        if operand_type != Type::Int {
-                            return Err(format!("Negation requires int operand, got {:?}", operand_type));
-                        }
-                        Ok(Type::Int)
-                    }
-                    UnaryOp::Not => {
-                        if operand_type != Type::Bool {
-                            return Err(format!("Logical not requires bool operand, got {:?}", operand_type));
-                        }
-                        Ok(Type::Bool)
-                    }
+                    UnaryOp::Negate => self.require(&t, &Type::Int, "negation operand must be int"),
+                    UnaryOp::Not    => self.require(&t, &Type::Bool, "logical not operand must be bool"),
                 }
             }
+
+            Expression::Binary { left, operator, right } => {
+                let lt = self.check_expression(left)?;
+                let rt = self.check_expression(right)?;
+                self.check_binary_op(operator, &lt, &rt)
+            }
+
             Expression::Call { function, arguments } => {
-                let (param_types, return_type) = self.functions.get(function)
-                    .ok_or(format!("Undefined function '{}'", function))?
-                    .clone();
+                // Look up the signature without cloning the whole map entry.
+                let sig = self.functions.get(function)
+                    .ok_or_else(|| self.error(format!("undefined function '{}'", function)))?;
+
+                let (param_types, return_type) = (sig.param_types.clone(), sig.return_type.clone());
 
                 if arguments.len() != param_types.len() {
-                    return Err(format!(
-                        "Function '{}' expects {} arguments, got {}",
+                    return Err(self.error(format!(
+                        "'{}' expects {} argument(s), got {}",
                         function, param_types.len(), arguments.len()
-                    ));
+                    )));
                 }
 
-                for (i, (arg, expected_type)) in arguments.iter().zip(param_types.iter()).enumerate() {
-                    let arg_type = self.check_expression(arg)?;
-                    if &arg_type != expected_type {
-                        return Err(format!(
-                            "Argument {} to function '{}': expected {:?}, got {:?}",
-                            i + 1, function, expected_type, arg_type
-                        ));
+                for (i, (arg, expected)) in arguments.iter().zip(param_types.iter()).enumerate() {
+                    let actual = self.check_expression(arg)?;
+                    if &actual != expected {
+                        return Err(self.error(format!(
+                            "argument {} of '{}': expected {:?}, got {:?}",
+                            i + 1, function, expected, actual
+                        )));
                     }
                 }
 
@@ -245,29 +215,85 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn declare_variable(&mut self, name: String, var_type: Type) -> Result<(), String> {
+    fn check_binary_op(&self, op: &BinaryOp, lt: &Type, rt: &Type) -> Result<Type, CompileError> {
+        match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply |
+            BinaryOp::Divide | BinaryOp::Modulo => {
+                if lt != &Type::Int || rt != &Type::Int {
+                    return Err(self.error(format!(
+                        "arithmetic operators require int operands, got {:?} and {:?}", lt, rt
+                    )));
+                }
+                Ok(Type::Int)
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                if lt != rt {
+                    return Err(self.error(format!(
+                        "equality operators require matching types, got {:?} and {:?}", lt, rt
+                    )));
+                }
+                Ok(Type::Bool)
+            }
+            BinaryOp::Less | BinaryOp::LessEqual |
+            BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                if lt != &Type::Int || rt != &Type::Int {
+                    return Err(self.error(format!(
+                        "comparison operators require int operands, got {:?} and {:?}", lt, rt
+                    )));
+                }
+                Ok(Type::Bool)
+            }
+            BinaryOp::And | BinaryOp::Or => {
+                if lt != &Type::Bool || rt != &Type::Bool {
+                    return Err(self.error(format!(
+                        "logical operators require bool operands, got {:?} and {:?}", lt, rt
+                    )));
+                }
+                Ok(Type::Bool)
+            }
+        }
+    }
+
+    fn declare_variable(&mut self, name: String, ty: Type) -> Result<(), CompileError> {
         let scope = self.symbol_table.last_mut().unwrap();
         if scope.contains_key(&name) {
-            return Err(format!("Variable '{}' already declared in this scope", name));
+            return Err(self.error(format!("'{}' is already declared in this scope", name)));
         }
-        scope.insert(name, var_type);
+        scope.insert(name, ty);
         Ok(())
     }
 
-    fn lookup_variable(&self, name: &str) -> Result<Type, String> {
+    fn lookup_variable(&self, name: &str) -> Result<Type, CompileError> {
         for scope in self.symbol_table.iter().rev() {
-            if let Some(var_type) = scope.get(name) {
-                return Ok(var_type.clone());
+            if let Some(ty) = scope.get(name) {
+                return Ok(ty.clone());
             }
         }
-        Err(format!("Undefined variable '{}'", name))
+        Err(self.error(format!("undefined variable '{}'", name)))
     }
 
-    fn enter_scope(&mut self) {
-        self.symbol_table.push(HashMap::new());
+    fn enter_scope(&mut self) { self.symbol_table.push(HashMap::new()); }
+    fn exit_scope(&mut self)  { self.symbol_table.pop(); }
+
+    fn error(&self, msg: impl Into<String>) -> CompileError {
+        CompileError::new(CompilePhase::Semantic, msg, 0, 0)
     }
 
-    fn exit_scope(&mut self) {
-        self.symbol_table.pop();
+    /// Checks that `expr` has `expected` type; emits a contextualised error otherwise.
+    fn expect_type(&mut self, expr: &Expression, expected: &Type, ctx: &str) -> Result<(), CompileError> {
+        let actual = self.check_expression(expr)?;
+        if &actual != expected {
+            return Err(self.error(format!("{} must be {:?}, got {:?}", ctx, expected, actual)));
+        }
+        Ok(())
+    }
+
+    /// Returns `Ok(ty.clone())` when `ty == expected`, otherwise a compile error.
+    fn require(&self, ty: &Type, expected: &Type, msg: &str) -> Result<Type, CompileError> {
+        if ty == expected {
+            Ok(ty.clone())
+        } else {
+            Err(self.error(format!("{}, got {:?}", msg, ty)))
+        }
     }
 }
