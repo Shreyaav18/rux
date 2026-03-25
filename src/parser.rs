@@ -88,6 +88,7 @@ impl Parser {
         if self.match_token(TokenType::Let)      { return self.parse_let_statement(); }
         if self.match_token(TokenType::If)       { return self.parse_if_statement(); }
         if self.match_token(TokenType::While)    { return self.parse_while_statement(); }
+        if self.match_token(TokenType::For)      { return self.parse_for_statement(); }
         if self.match_token(TokenType::Return)   { return self.parse_return_statement(); }
         if self.match_token(TokenType::Print)    { return self.parse_print_statement(); }
         if self.match_token(TokenType::Break)    { return self.parse_break_statement(); }
@@ -155,6 +156,24 @@ impl Parser {
         self.consume(TokenType::RightParen, "expected ')' after condition")?;
         let body = self.parse_block()?;
         Ok(Statement::While { condition, body })
+    }
+
+    fn parse_for_statement(&mut self) -> Result<Statement, CompileError> {
+        let var = self.consume(TokenType::Identifier, "expected loop variable after 'for'")?.lexeme.clone();
+        self.consume(TokenType::In, "expected 'in' after loop variable")?;
+        let start = self.parse_expression()?;
+
+        let inclusive = if self.match_token(TokenType::DotDotEq) {
+            true
+        } else {
+            self.consume(TokenType::DotDot, "expected '..' or '..=' in range")?;
+            false
+        };
+
+        let end = self.parse_expression()?;
+        let body = self.parse_block()?;
+
+        Ok(Statement::For { var, start, end, inclusive, body })
     }
 
     fn parse_return_statement(&mut self) -> Result<Statement, CompileError> {
