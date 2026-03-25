@@ -9,6 +9,8 @@ struct FunctionSig {
     return_type: Type,
 }
 
+// ── Analyzer ──────────────────────────────────────────────────────────────────
+
 pub struct SemanticAnalyzer {
     /// Lexical scopes, innermost last.
     symbol_table: Vec<HashMap<String, Type>>,
@@ -121,6 +123,22 @@ impl SemanticAnalyzer {
                 self.loop_depth -= 1;
             }
 
+            Statement::For { var, start, end, body, .. } => {
+                // Both bounds must be int.
+                self.expect_type(start, &Type::Int, "for loop start bound")?;
+                self.expect_type(end, &Type::Int, "for loop end bound")?;
+
+                // The loop variable is scoped to the body.
+                self.enter_scope();
+                self.declare_variable(var.clone(), Type::Int)?;
+                self.loop_depth += 1;
+                for stmt in body {
+                    self.check_statement(stmt)?;
+                }
+                self.loop_depth -= 1;
+                self.exit_scope();
+            }
+
             Statement::Break | Statement::Continue => {
                 if self.loop_depth == 0 {
                     let kw = if matches!(stmt, Statement::Break) { "break" } else { "continue" };
@@ -164,6 +182,8 @@ impl SemanticAnalyzer {
         self.exit_scope();
         Ok(())
     }
+
+    // ── Expression type-checking ──────────────────────────────────────────────
 
     fn check_expression(&mut self, expr: &Expression) -> Result<Type, CompileError> {
         match expr {
@@ -254,6 +274,8 @@ impl SemanticAnalyzer {
         }
     }
 
+    // ── Symbol-table helpers ──────────────────────────────────────────────────
+
     fn declare_variable(&mut self, name: String, ty: Type) -> Result<(), CompileError> {
         let scope = self.symbol_table.last_mut().unwrap();
         if scope.contains_key(&name) {
@@ -275,7 +297,10 @@ impl SemanticAnalyzer {
     fn enter_scope(&mut self) { self.symbol_table.push(HashMap::new()); }
     fn exit_scope(&mut self)  { self.symbol_table.pop(); }
 
+    // ── Error construction ────────────────────────────────────────────────────
+
     fn error(&self, msg: impl Into<String>) -> CompileError {
+        // Semantic errors don't have a token handy; use 0:0 as a sentinel.
         CompileError::new(CompilePhase::Semantic, msg, 0, 0)
     }
 
